@@ -1,0 +1,59 @@
+{
+  "name": "pi-image-slim",
+  "version": "0.1.0",
+  "description": "Pi extension that stops historical images from being re-uploaded on every request — each image is sent in full exactly once, then replaced by a path-carrying placeholder.",
+  "type": "module",
+  "license": "MIT",
+  "author": "wiidede",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wiidede/pi-image-slim.git"
+  },
+  "homepage": "https://github.com/wiidede/pi-image-slim#readme",
+  "bugs": {
+    "url": "https://github.com/wiidede/pi-image-slim/issues"
+  },
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "pi-package",
+    "pi-coding-agent",
+    "coding-agent",
+    "image",
+    "images",
+    "context",
+    "bandwidth",
+    "upload",
+    "tokens",
+    "screenshot"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.3.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "test": "node test/run.ts",
+    "check": "tsc --noEmit && npm run test"
+  }
+}
