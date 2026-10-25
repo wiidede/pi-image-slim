@@ -1,10 +1,14 @@
 {
   "compilerOptions": {
     "target": "ES2023",
-    "lib": ["ES2023"],
+    "lib": [
+      "ES2023"
+    ],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "types": ["node"],
+    "types": [
+      "node"
+    ],
     "allowImportingTsExtensions": true,
     "strict": true,
     "noFallthroughCasesInSwitch": true,
@@ -15,5 +19,13 @@
     "erasableSyntaxOnly": true,
     "skipLibCheck": true
   },
-  "include": ["index.ts", "test/**/*.ts", "vitest.config.ts"]
+  "include": [
+    "index.ts",
+    "image.ts",
+    "caption.ts",
+    "config.ts",
+    "protocol.ts",
+    "test/**/*.ts",
+    "vitest.config.ts"
+  ]
 }

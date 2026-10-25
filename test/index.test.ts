@@ -1,5 +1,8 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import extension, { stripOldImages } from '../index.ts'
+import extension, { captionWanted, stripOldImages } from '../index.ts'
 
 // ─────────────────────────────────────────────────────────────
 // helpers
@@ -21,6 +24,17 @@ function countImages(payload: unknown): number {
 }
 function countPlaceholders(payload: unknown): number {
   return JSON.stringify(payload).split('removed from history').length - 1
+}
+
+/** Read a text block out of a payload without resorting to `any`. */
+function textAt(payload: { messages: unknown[] }, m: number, ...path: (string | number)[]): string {
+  let node: unknown = payload.messages[m]
+  for (const key of path) {
+    if (node === undefined || node === null)
+      return ''
+    node = (node as Record<string | number, unknown>)[key]
+  }
+  return (node as { text?: string } | undefined)?.text ?? ''
 }
 
 /** A read → tool result → image carrier cycle, the way Pi serialises it. */
@@ -58,6 +72,52 @@ function imageCycle(index: number, bytes = 1000, path = `/proj/img${index}.png`)
   ]
 }
 
+/** One tool call returning `count` images — they share a single message. */
+function batchCycle(index: number, count: number, bytes = 1000, path = `/proj/batch${index}.png`): unknown[] {
+  return [
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        {
+          id: `c${index}`,
+          type: 'function',
+          function: { name: 'screenshot_all', arguments: '{}' },
+        },
+      ],
+    },
+    {
+      role: 'tool',
+      content: `Image file: ${path}`,
+      tool_call_id: `c${index}`,
+    },
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Attached image(s) from tool result:' },
+        ...Array.from({ length: count }, () => ({
+          type: 'image_url',
+          image_url: { url: `data:image/webp;base64,${fakeBase64(bytes)}` },
+        })),
+      ],
+    },
+  ]
+}
+
+/** A minimal newer image carrier, used to push an older one out of the window. */
+function newerCarrier(): unknown {
+  return {
+    role: 'user',
+    content: [
+      { type: 'text', text: 'Attached image(s) from tool result:' },
+      {
+        type: 'image_url',
+        image_url: { url: 'data:image/webp;base64,BBBB' },
+      },
+    ],
+  }
+}
+
 function payloadWith(turns: { images: number, bytes?: number }[]): { messages: unknown[] } {
   const messages: unknown[] = [
     { role: 'system', content: 'sys' },
@@ -74,45 +134,79 @@ function payloadWith(turns: { images: number, bytes?: number }[]): { messages: u
 // tests
 // ─────────────────────────────────────────────────────────────
 
-describe('turn scoping', () => {
-  it('sends the current turn\'s images in full', () => {
-    const payload = payloadWith([
-      { images: 10 },
-    ])
+describe('keep window', () => {
+  it('keeps every image when the window is not exceeded', () => {
+    const payload = {
+      messages: [
+        { role: 'user', content: 'hi' },
+        ...batchCycle(0, 10),
+      ],
+    }
     const before = countImages(payload)
     expect(stripOldImages(payload, 'openai-completions')).toBe(0)
     expect(countImages(payload)).toBe(before)
   })
 
-  it('replaces the previous turn\'s images with placeholders', () => {
-    const payload = payloadWith([
-      { images: 3 },
-      { images: 2 },
-    ])
-    expect(stripOldImages(payload, 'openai-completions')).toBe(3)
+  it('keeps the whole batch a single tool call returned', () => {
+    // Ten screenshots from one call share one message, so they live or die together.
+    const payload = {
+      messages: [
+        { role: 'user', content: 'hi' },
+        ...batchCycle(0, 10),
+        ...batchCycle(1, 10),
+      ],
+    }
+    // Two messages, window of 2 — nothing to do.
+    expect(stripOldImages(payload, 'openai-completions', 2)).toBe(0)
+    expect(countImages(payload)).toBe(20)
+  })
+
+  it('replaces images older than the window', () => {
+    const payload = {
+      messages: [
+        { role: 'user', content: 'hi' },
+        ...batchCycle(0, 3),
+        ...batchCycle(1, 2),
+      ],
+    }
+    expect(stripOldImages(payload, 'openai-completions', 1)).toBe(3)
     expect(countPlaceholders(payload)).toBe(3)
     expect(countImages(payload)).toBe(2)
   })
 
-  it('uploads every image in full exactly once across a session', () => {
-    // Simulate 5 consecutive requests, each appending one turn of 3 images.
+  it('drops every image in a long agent loop, keeping only the window', () => {
+    // The case the old turn-based rule missed: one user message, then many
+    // autonomous steps. `turnStart()` never moved, so nothing was ever stripped
+    // and every screenshot was re-uploaded on every step.
     const messages: unknown[] = [
-      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'fix the CSS everywhere' },
     ]
     let n = 0
     let totalSentBytes = 0
-    for (let turn = 0; turn < 5; turn++) {
-      messages.push({ role: 'user', content: `turn ${turn}` })
-      for (let i = 0; i < 3; i++) messages.push(...imageCycle(n++, 200_000))
+    const STEPS = 30
+    for (let step = 0; step < STEPS; step++) {
+      messages.push(...imageCycle(n++, 68_000))
       const payload = {
         messages: structuredClone(messages),
       }
-      stripOldImages(payload, 'openai-completions')
+      stripOldImages(payload, 'openai-completions', 2)
       totalSentBytes += sizeOf(payload)
     }
-    const fullySent = 15 * 200_000
-    // 15 images × 200 KB sent once = 3 MB; plus the last turn re-sent a few times.
-    expect(totalSentBytes).toBeLessThan(fullySent * 1.6)
+    // Ideal is 30 images × 68 KB sent once; a window of 2 costs at most 3x that.
+    const ideal = STEPS * 68_000
+    expect(totalSentBytes).toBeLessThan(ideal * 3)
+    // The old behaviour was ~16x ideal.
+    expect(totalSentBytes).toBeGreaterThan(ideal)
+  })
+
+  it('never strips the newest message, even with a window of 1', () => {
+    const payload = payloadWith([
+      { images: 1 },
+      { images: 1 },
+      { images: 1 },
+    ])
+    expect(stripOldImages(payload, 'openai-completions', 1)).toBe(2)
+    expect(countImages(payload)).toBe(1)
   })
 
   it('names the right file in the placeholder', () => {
@@ -120,40 +214,16 @@ describe('turn scoping', () => {
       { images: 2 },
       { images: 1 },
     ])
-    stripOldImages(payload, 'openai-completions')
+    stripOldImages(payload, 'openai-completions', 1)
     const serialized = JSON.stringify(payload)
-    expect(serialized).toContain(': /proj/img0.png —')
-    expect(serialized).toContain(': /proj/img1.png —')
-    expect(serialized).not.toContain(': /proj/img2.png —')
+    expect(serialized).toContain('Re-read /proj/img0.png')
+    expect(serialized).toContain('Re-read /proj/img1.png')
+    expect(serialized).not.toContain('Re-read /proj/img2.png')
   })
 
-  it('strips nothing when there is no real user message', () => {
-    const payload = {
-      messages: [
-        ...imageCycle(0),
-        ...imageCycle(1),
-      ],
-    }
-    expect(stripOldImages(payload, 'openai-completions')).toBe(0)
-  })
-
-  it('opens a new turn for a user message carrying an image', () => {
-    const payload = payloadWith([
-      { images: 1 },
-    ])
-    payload.messages.push({
-      role: 'user',
-      content: [
-        { type: 'text', text: 'and this one?' },
-        {
-          type: 'image_url',
-          image_url: { url: 'data:image/png;base64,AAAA' },
-        },
-      ],
-    })
-    // The pasted image has no tool_result and no synthetic prefix, so it is real input.
-    expect(stripOldImages(payload, 'openai-completions')).toBe(1)
-    expect(countImages(payload)).toBe(1)
+  it('strips nothing when the payload holds no messages', () => {
+    expect(stripOldImages({}, 'openai-completions')).toBe(0)
+    expect(stripOldImages({ messages: [] }, 'openai-completions')).toBe(0)
   })
 })
 
@@ -163,7 +233,7 @@ describe('protocol shapes', () => {
       { images: 1 },
       { images: 1 },
     ])
-    stripOldImages(payload, 'openai-completions')
+    stripOldImages(payload, 'openai-completions', 1)
     expect(JSON.stringify(payload)).toContain('{"type":"text","text":"[image removed')
   })
 
@@ -172,7 +242,7 @@ describe('protocol shapes', () => {
       { images: 1 },
       { images: 1 },
     ])
-    stripOldImages(payload, 'openai-responses')
+    stripOldImages(payload, 'openai-responses', 1)
     expect(JSON.stringify(payload)).toContain('{"type":"input_text"')
   })
 
@@ -182,7 +252,7 @@ describe('protocol shapes', () => {
         { images: 1 },
         { images: 1 },
       ])
-      stripOldImages(payload, api)
+      stripOldImages(payload, api, 1)
       expect(JSON.stringify(payload), api).toContain('{"text":"[image removed')
     }
   })
@@ -192,7 +262,7 @@ describe('protocol shapes', () => {
       { images: 1 },
       { images: 1 },
     ])
-    stripOldImages(payload, undefined)
+    stripOldImages(payload, undefined, 1)
     expect(JSON.stringify(payload)).toContain('{"type":"text","text":"[image removed')
   })
 })
@@ -284,8 +354,11 @@ describe('image detection across protocols', () => {
     for (const [name, payload] of Object.entries(shapes)) {
       const container = payload as Record<string, unknown>
       const list = (container.messages ?? container.input ?? container.contents) as unknown[]
+      // A second carrier of the same shape, so the window has something newer to
+      // keep and the original becomes strippable.
+      list.push(...structuredClone(list))
       list.push(trailingUser[name])
-      const removed = stripOldImages(container, 'openai-completions')
+      const removed = stripOldImages(container, 'openai-completions', 1)
       expect(removed, name).toBeGreaterThan(0)
     }
   })
@@ -315,8 +388,117 @@ describe('image detection across protocols', () => {
         },
       ],
     }
-    expect(stripOldImages(payload, 'openai-completions')).toBe(1)
-    expect(JSON.stringify(payload)).toContain('re-attach it')
+    expect(stripOldImages(payload, 'openai-completions', 1)).toBe(1)
+    expect(JSON.stringify(payload)).toContain('Re-attach it')
+  })
+  it('reuses a note that sits in the same message (anthropic layout)', () => {
+    // Regression: the note search used to start at index - 1, so anthropic's
+    // tool_result — where the note and the image share one message — always
+    // produced a pathless "Re-attach it" placeholder.
+    const payload = {
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'look' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 't1',
+              content: [
+                { type: 'text', text: 'Image file: /tmp/shot.png\nImage description: A settings panel.' },
+                {
+                  type: 'image',
+                  source: { type: 'base64', media_type: 'image/webp', data: 'AAAA' },
+                },
+              ],
+            },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'ok' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'next' },
+          ],
+        },
+        newerCarrier(),
+      ],
+    }
+
+    expect(stripOldImages(payload, 'anthropic-messages', 1)).toBe(1)
+    const text = textAt(payload, 1, 'content', 0, 'content', 1)
+    expect(text).toContain('Re-read /tmp/shot.png')
+    expect(text).not.toContain('Re-attach')
+  })
+
+  it('reuses a note from the previous message (openai layout)', () => {
+    const payload = payloadWith([
+      { images: 1 },
+      { images: 1 },
+    ])
+    expect(stripOldImages(payload, 'openai-completions', 1)).toBe(1)
+    // The first carrier is [text header, placeholder]; its note came from the
+    // tool message just before it.
+    const carrier = payload.messages[4] as { content: { text?: string }[] }
+    const texts = carrier.content.map(part => part.text ?? '')
+    expect(texts.join('\n')).toContain('Re-read /proj/img0.png')
+  })
+
+  it('falls back to Re-attach when no path was ever recorded', () => {
+    const payload = {
+      messages: [
+        { role: 'user', content: 'hi' },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/png;base64,AAAA' },
+            },
+          ],
+        },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'next' },
+        newerCarrier(),
+      ],
+    }
+    expect(stripOldImages(payload, 'openai-completions', 1)).toBe(1)
+    const text = textAt(payload, 1, 'content', 0)
+    expect(text).toContain('Re-attach')
+  })
+
+  it('strips without ever parsing base64 out of the payload', () => {
+    // The strip pass must stay a pointer swap. A data URL whose mime type is a
+    // whole string (not one character) used to break the old regex parser, and
+    // that parser existed only because captions lived in a hash-keyed table.
+    const payload = {
+      messages: [
+        { role: 'user', content: 'hi' },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/webp;base64,ZZZZ' },
+            },
+          ],
+        },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'next' },
+        newerCarrier(),
+      ],
+    }
+    expect(stripOldImages(payload, 'openai-completions', 1)).toBe(1)
   })
 })
 
@@ -364,7 +546,7 @@ describe('robustness', () => {
         { role: 'user', content: 'x' },
       ],
     }
-    stripOldImages(payload, 'openai-completions')
+    stripOldImages(payload, 'openai-completions', 1)
     for (const message of payload.messages as { content: unknown }[]) {
       if (Array.isArray(message.content))
         expect(message.content.length).toBeGreaterThan(0)
@@ -373,6 +555,14 @@ describe('robustness', () => {
 })
 
 describe('hooks', () => {
+  it('skips the caption when stripping is off', () => {
+    // With `strip: false` the image stays in context forever, so a description
+    // would cost a round trip and a transcript note for nothing.
+    expect(captionWanted({ caption: true, strip: true })).toBe(true)
+    expect(captionWanted({ caption: true, strip: false })).toBe(false)
+    expect(captionWanted({ caption: false, strip: true })).toBe(false)
+  })
+
   it('registers both hooks and wires them up', async () => {
     const handlers: Record<string, (...args: never[]) => unknown> = {}
     const pi = {
@@ -385,12 +575,15 @@ describe('hooks', () => {
     expect(handlers.tool_result).toBeDefined()
     expect(handlers.before_provider_request).toBeDefined()
 
-    const result = (await handlers.tool_result!({
-      input: { path: '/a/b.png' },
-      content: [
-        { type: 'image', data: 'AAA', mimeType: 'image/png' },
-      ],
-    } as never)) as { content: { text?: string }[] } | undefined
+    const result = (await handlers.tool_result!(
+      {
+        input: { path: '/a/b.png' },
+        content: [
+          { type: 'image', data: 'AAA', mimeType: 'image/png' },
+        ],
+      } as never,
+      { model: undefined } as never,
+    )) as { content: { text?: string }[] } | undefined
     expect(result).toBeDefined()
     expect(result!.content.at(-1)?.text).toBe('Image file: /a/b.png')
 
@@ -417,6 +610,147 @@ describe('hooks', () => {
       const fn = handlers[name] as (...a: never[]) => unknown
       expect(fn.constructor.name, name).toBe('AsyncFunction')
     }
+  })
+})
+
+describe('tool_result passthrough', () => {
+  const handlers: Record<string, (...args: never[]) => Promise<unknown>> = {}
+  extension({
+    on: (e: string, h: never) => {
+      handlers[e] = h
+      return () => {}
+    },
+  } as never)
+
+  /** Run the hook against a temp project whose `.pi` config we control. */
+  async function withConfig(
+    config: Record<string, unknown>,
+    event: Record<string, unknown>,
+    ctx: Record<string, unknown> = {},
+  ): Promise<Record<string, unknown> | undefined> {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-image-slim-hook-'))
+    try {
+      mkdirSync(join(cwd, '.pi'), { recursive: true })
+      writeFileSync(join(cwd, '.pi', 'pi-image-slim.json'), JSON.stringify(config))
+      return await handlers.tool_result!(
+        {
+          input: { path: '/a/b.png' },
+          ...event,
+        } as never,
+        {
+          cwd,
+          model: {
+            input: ['text', 'image'],
+          },
+          modelRegistry: {
+            complete: async (_model: never, context: { messages: { content: { data: string }[] }[] }) => {
+              const data = context.messages[0]!.content[0]!.data
+              if (data === 'FAIL')
+                throw new Error('caption failed')
+              return {
+                content: [
+                  { type: 'text', text: `caption for ${data}` },
+                ],
+              }
+            },
+          },
+          ...ctx,
+        } as never,
+      ) as Record<string, unknown> | undefined
+    }
+    finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  }
+
+  const imageEvent = {
+    content: [
+      { type: 'image', data: 'not-a-real-png', mimeType: 'image/png' },
+    ],
+  }
+
+  it('writes no note at all when stripping is off', async () => {
+    // With `strip: false` the image never leaves context, so a path note would
+    // be permanent clutter. Compression still runs independently.
+    const out = await withConfig({ strip: false, compress: false }, imageEvent)
+    expect(out).toBeUndefined()
+  })
+
+  it('writes the path note when stripping is on', async () => {
+    const out = await withConfig({ compress: false }, imageEvent)
+    const texts = (out!.content as { type: string, text?: string }[])
+      .filter(block => block.type === 'text')
+      .map(block => block.text)
+    // Single image: one note block, two lines.
+    expect(texts).toEqual([
+      'Image file: /a/b.png\nImage description: caption for not-a-real-png',
+    ])
+  })
+
+  it('keeps details and structuredContent instead of blanking them', async () => {
+    // Pi reads both off the hook result, so returning only `content` used to
+    // wipe them for every image-bearing tool call.
+    const details = {
+      truncation: { truncated: false },
+    }
+    const structuredContent = { path: '/a/b.png', width: 64 }
+    const out = await withConfig(
+      { compress: false },
+      { ...imageEvent, details, structuredContent },
+    )
+    expect(out!.details).toEqual(details)
+    expect(out!.structuredContent).toEqual(structuredContent)
+  })
+
+  it('numbers descriptions when one call returns several images', async () => {
+    const out = await withConfig(
+      { compress: false },
+      {
+        input: { path: '/a/batch.png' },
+        content: [
+          { type: 'image', data: 'one', mimeType: 'image/png' },
+          { type: 'image', data: 'two', mimeType: 'image/png' },
+        ],
+      },
+    )
+    const note = (out!.content as { type: string, text?: string }[])
+      .filter(block => block.type === 'text')
+      .map(block => block.text)
+      .join('\n')
+    expect(note).toContain('Image description: [1] caption for one')
+    expect(note).toContain('Image description: [2] caption for two')
+    // No Image file: line — one reported path cannot address two pictures.
+    expect(note).not.toContain('Image file:')
+    expect(note).toContain('2 images from one call')
+  })
+
+  it('keeps description slots aligned when one caption fails', async () => {
+    // A failed caption used to be filtered out, shifting every later description
+    // onto the wrong picture with no warning at all.
+    const out = await withConfig(
+      { compress: false },
+      {
+        input: {},
+        content: [
+          { type: 'image', data: 'one', mimeType: 'image/png' },
+          { type: 'image', data: 'FAIL', mimeType: 'image/png' },
+          { type: 'image', data: 'three', mimeType: 'image/png' },
+        ],
+      },
+    )
+    const note = (out!.content as { type: string, text?: string }[])
+      .filter(block => block.type === 'text')
+      .map(block => block.text)
+      .join('\n')
+    expect(note).toContain('Image description: [1] caption for one')
+    expect(note).toContain('Image description: [2] (no description)')
+    expect(note).toContain('Image description: [3] caption for three')
+  })
+
+  it('leaves details alone when the result has none', async () => {
+    const out = await withConfig({ compress: false }, imageEvent)
+    expect('details' in out!).toBe(false)
+    expect('structuredContent' in out!).toBe(false)
   })
 })
 
@@ -448,7 +782,7 @@ describe('bandwidth with realistic sizes', () => {
       messages: structuredClone(messages),
     }
     const before = sizeOf(payload)
-    stripOldImages(payload, 'openai-completions')
+    stripOldImages(payload, 'openai-completions', 1)
     const after = sizeOf(payload)
     expect(before / after).toBeGreaterThan(3)
   })

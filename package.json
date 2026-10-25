@@ -40,7 +40,11 @@
     "LICENSE",
     "README.md",
     "README.zh-CN.md",
-    "index.ts"
+    "caption.ts",
+    "config.ts",
+    "image.ts",
+    "index.ts",
+    "protocol.ts"
   ],
   "engines": {
     "node": ">=22.19.0"
@@ -56,6 +60,12 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "@jsquash/jpeg": "^1.6.0",
+    "@jsquash/png": "^3.1.1",
+    "@jsquash/resize": "^2.1.1",
+    "@jsquash/webp": "^1.5.0"
   },
   "devDependencies": {
     "@antfu/eslint-config": "^10.0.0",
