@@ -2,6 +2,7 @@
   "name": "pi-image-slim",
   "type": "module",
   "version": "0.1.0",
+  "packageManager": "pnpm@12.15.0",
   "description": "Pi extension that stops historical images from being re-uploaded on every request — each image is sent in full exactly once, then replaced by a path-carrying placeholder.",
   "author": "wiidede",
   "license": "MIT",
@@ -73,6 +74,7 @@
     "@types/node": "^26.6.5",
     "bumpp": "^12.3.0",
     "eslint": "^10.13.0",
+    "pnpm": "^12.15.0",
     "typescript": "^6.0.3",
     "vitest": "^5.0.5"
   }
