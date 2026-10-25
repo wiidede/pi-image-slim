@@ -1,0 +1,7 @@
+minimumReleaseAgeExcludePrune: true
+trustPolicy: no-downgrade
+shellEmulator: true
+
+allowBuilds:
+  '@google/genai': true
+  protobufjs: true

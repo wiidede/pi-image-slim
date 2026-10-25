@@ -1,5 +1,7 @@
 # pi-image-slim
 
+[中文文档](./README.zh-CN.md)
+
 A [Pi](https://pi.dev) extension that stops historical images from being re-uploaded on every request.
 
 Screenshots are expensive. Once an image enters the conversation it is part of the request body forever, so a session that has read 30 MB of mockups uploads 30 MB on **every** turn. Prompt caching saves server-side compute, not bandwidth. On a slow uplink that is a minute of pure upload before the model even starts thinking.
@@ -67,33 +69,33 @@ This matters because count-based rules silently drop images inside the turn that
 
 ### What the model sees, per turn
 
-| | Sent |
-|---|---|
-| Images read in the current turn | full image data |
-| Image you just pasted or dragged in | full image data |
-| Images from earlier turns | placeholder with the file path |
-| Everything else | unchanged |
+|                                     | Sent                           |
+| ----------------------------------- | ------------------------------ |
+| Images read in the current turn     | full image data                |
+| Image you just pasted or dragged in | full image data                |
+| Images from earlier turns           | placeholder with the file path |
+| Everything else                     | unchanged                      |
 
 ## Measured
 
 Real session, 37 screenshots read through `read`, ~30.7 MB of base64 history:
 
-| | Request body | Upload at 500 KB/s |
-|---|---|---|
-| No extension | 30.7 MB | ~61 s |
-| With `pi-image-slim` | 3.1 MB | ~6 s |
+|                      | Request body | Upload at 500 KB/s |
+| -------------------- | ------------ | ------------------ |
+| No extension         | 30.7 MB      | ~61 s              |
+| With `pi-image-slim` | 3.1 MB       | ~6 s               |
 
-Processing cost of the pass itself: **under 1 ms** for a 30 MB body. It is pure object-pointer swapping — nothing is decoded, decoded, resized, or re-encoded, so there is no image-quality loss and no CPU spike.
+Processing cost of the pass itself: **under 1 ms** for a 30 MB body. It is pure object-pointer swapping — nothing is decoded, resized, or re-encoded, so there is no image-quality loss and no CPU spike.
 
 ## Compatibility
 
 The placeholder's shape is chosen from the model's API, so switching providers does not produce an HTTP 400:
 
-| API | Placeholder part |
-|---|---|
-| `openai-completions`, `anthropic-messages`, `mistral-conversations`, `pi-messages` | `{ type: "text", text }` |
-| `openai-responses`, `azure-openai-responses`, `openai-codex-responses` | `{ type: "input_text", text }` |
-| `google-generative-ai`, `google-vertex`, `bedrock-converse-stream` | `{ text }` |
+| API                                                                                | Placeholder part               |
+| ---------------------------------------------------------------------------------- | ------------------------------ |
+| `openai-completions`, `anthropic-messages`, `mistral-conversations`, `pi-messages` | `{ type: "text", text }`       |
+| `openai-responses`, `azure-openai-responses`, `openai-codex-responses`             | `{ type: "input_text", text }` |
+| `google-generative-ai`, `google-vertex`, `bedrock-converse-stream`                 | `{ text }`                     |
 
 Image blocks are detected in all of those protocols, including images nested inside `tool_result` content.
 
@@ -117,22 +119,12 @@ Or uninstall the package. Nothing is persisted anywhere, so removal leaves no tr
 ```bash
 git clone https://github.com/wiidede/pi-image-slim
 cd pi-image-slim
-npm install
-npm test        # 18 tests, no network, no fixtures
-npm run check   # tsc --noEmit + tests
+pnpm install
+pnpm test        # 18 tests, no network, no fixtures
+pnpm check       # lint + typecheck + tests
 ```
 
 The test suite covers turn scoping, per-protocol placeholder shapes, image detection across five protocol layouts, idempotency, malformed payloads, and a bandwidth comparison.
-
-## 中文说明
-
-Pi 的历史图片会在**每一轮请求**里被完整重传（`chat/completions` 是无状态的，prompt cache 只省算力不省带宽）。这个扩展让每张图只在**它被读进来的那一轮**完整上传一次，之后替换成带文件路径的一行占位符；模型需要再看就自己 `read` 一次。
-
-- 同一轮内读 10 张图 → 10 张都会完整发出
-- 用户说下一句话 → 上一轮的图变成占位符
-- 只改发出去的请求，不动会话文件、不动 `models.json`
-- 纯指针替换，30MB 的请求体处理耗时 < 1ms，无画质损失
-- `PI_IMAGE_SLIM=off` 关闭，删包即回滚
 
 ## License
 

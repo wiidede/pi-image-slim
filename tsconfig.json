@@ -1,19 +1,19 @@
 {
   "compilerOptions": {
     "target": "ES2023",
+    "lib": ["ES2023"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2023"],
     "types": ["node"],
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "noImplicitOverride": true,
-    "noFallthroughCasesInSwitch": true,
     "allowImportingTsExtensions": true,
+    "strict": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true,
     "verbatimModuleSyntax": true,
     "erasableSyntaxOnly": true,
-    "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["index.ts", "test/**/*.ts"]
+  "include": ["index.ts", "test/**/*.ts", "vitest.config.ts"]
 }

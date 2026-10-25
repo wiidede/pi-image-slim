@@ -1,7 +1,8 @@
-node_modules/
-package-lock.json
-pnpm-lock.yaml
-yarn.lock
-bun.lockb
-*.log
+node_modules
 .DS_Store
+*.log
+*.tgz
+coverage
+dist
+temp
+.pnpm-store
