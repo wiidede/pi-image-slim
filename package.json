@@ -1,7 +1,7 @@
 {
   "name": "pi-image-slim",
   "type": "module",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "packageManager": "pnpm@12.15.0",
   "description": "Pi extension that compresses tool-returned images and optionally replaces older images with text placeholders to reduce upload bandwidth.",
   "author": "wiidede",
