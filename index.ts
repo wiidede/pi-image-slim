@@ -30,10 +30,10 @@
  *
  * Why the description lives in the transcript
  *   The note is ordinary message text, so it is persisted with the session and is
- *   still there after `/reload`, a restart, or compaction — unlike a side table
+ *   still there after `/reload` or a restart — unlike a side table
  *   keyed by image hash, which would silently degrade every old placeholder to a
  *   bare path. It also means the strip pass never has to read pixels back out of
- *   a provider payload, so it stays a pure pointer swap.
+ *   a provider payload. Compaction may summarize or omit the note.
  *
  * A window of turns, not of messages
  *   Everything the agent produced since the newest `keepTurns` user messages were
@@ -43,10 +43,9 @@
  *   · Reading ten screenshots in one turn keeps all ten visible for the rest of
  *     that turn. A count-based window got this wrong: the third screenshot pushed
  *     the first one out, in the middle of the task that needed both.
- *   · Nothing changes *within* a turn, so the request prefix is byte-identical on
- *     every step of a loop and the prompt cache keeps hitting. Stripping lands on
- *     a turn boundary, which costs exactly one cache miss — in the request where
- *     the images actually went stale.
+ *   · With the cap off, stripping does not change existing prefixes within a
+ *     turn. Expiry changes the prefix at turn boundaries; actual cache reuse
+ *     depends on the provider's rules and cache lifetime.
  *   · A turn boundary is a real user message. A tool that returns ten screenshots
  *     hoists them into a synthetic user message of their own, and turning that
  *     into a boundary would cut the turn in half, so carriers are skipped.
@@ -59,16 +58,14 @@
  * Properties
  *   · Compression is best-effort: a failure, an unsupported format, or a result
  *     that is not smaller leaves the original bytes untouched.
- *   · Stripping is pure pointer swapping — a 30 MB body is processed in about a
- *     millisecond.
+ *   · Stripping copies changed object ancestors without decoding image data.
  *   · Idempotent: processing the same body twice changes nothing the second time.
- *   · Only the outbound request body is touched. Session files and `models.json`
- *     are never modified, so original images stay on disk and can be re-read.
- *   · Protocol-aware placeholder shape (chosen from `model.api`), so switching
- *     providers does not produce a 400.
+ *   · Stripping only changes the outbound request. Compression changes images
+ *     stored in the session; source image files are never modified.
+ *   · Placeholder shapes and nested tool-result handling match the provider API.
  *   · Configure via `pi-image-slim.json` in the agent directory or `.pi/`. Each
- *     stage has its own switch, so you can compress without ever touching the
- *     context, or strip without compressing.
+ *     stage has its own switch, so you can compress without removing images,
+ *     or strip without compressing.
  */
 
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
@@ -78,8 +75,12 @@ import { DEFAULTS, loadConfig } from './config.ts'
 import { compressImage } from './image.ts'
 import {
   collectImageParts,
+  copyPayloadMessages,
+  imageCarrierKind,
   isImageCarrier,
+  isImagePart,
   isRecord,
+  replaceImageParts,
   textPartFor,
   topLevelMessages,
 } from './protocol.ts'
@@ -132,63 +133,79 @@ export interface ImageNote {
   caption?: string
 }
 
-/**
- * Read an `Image file:` / `Image description:` note out of a message.
- * Strings only — the walk never descends into a base64 payload's meaning, and it
- * stops at the first note it finds.
- */
-function noteIn(message: unknown): ImageNote | undefined {
-  const out: ImageNote = {}
-  let done = false
-
+/** Read only tool-result text fields, never image bytes or tool arguments. */
+function noteIn(scope: unknown): ImageNote | undefined {
+  const paths = new Set<string>()
+  let batch = false
   const walk = (node: unknown): void => {
-    if (done)
-      return
     if (typeof node === 'string') {
       for (const line of node.split('\n')) {
         const trimmed = line.trim()
-        if (out.path === undefined && trimmed.startsWith(PATH_LINE)) {
-          out.path = trimmed.slice(PATH_LINE.length).trim() || undefined
+        if (trimmed.startsWith(PATH_LINE)) {
+          const path = trimmed.slice(PATH_LINE.length).trim()
+          if (path)
+            paths.add(path)
         }
-        else if (out.caption === undefined && trimmed.startsWith(CAPTION_LINE)) {
-          out.caption = trimmed.slice(CAPTION_LINE.length).trim() || undefined
-        }
+        if (trimmed.startsWith(BATCH_LINE))
+          batch = true
       }
-      if (out.path !== undefined && out.caption !== undefined)
-        done = true
       return
     }
     if (Array.isArray(node)) {
       for (const item of node) walk(item)
       return
     }
-    if (!isRecord(node))
+    if (!isRecord(node) || isImagePart(node))
       return
-    for (const value of Object.values(node)) walk(value)
+    for (const key of [
+      'text',
+      'content',
+      'output',
+      'error',
+      'response',
+    ]) walk(node[key])
   }
-
-  walk(message)
-  return out.path === undefined && out.caption === undefined
-    ? undefined
-    : out
+  walk(scope)
+  return !batch && paths.size === 1
+    ? { path: paths.values().next().value }
+    : undefined
 }
 
-/**
- * Look for a note in the image's own message first, then up to two messages back.
- *
- * The order matters. `openai-completions` hoists images into a synthetic user
- * message that follows the tool message, so the note is one step *back*.
- * `anthropic-messages` leaves the image inside the tool result, so the note is in
- * the *same* message — starting the search at `index - 1` would miss it and
- * silently drop both the path and the description.
- */
-function nearbyNote(messages: unknown[], index: number): ImageNote | undefined {
-  for (let i = index; i >= Math.max(0, index - 2); i--) {
-    const found = noteIn(messages[i])
-    if (found)
-      return found
+/** Only borrow a note when lifted images have one unambiguous tool result. */
+function carrierNote(messages: unknown[], index: number, imageCount: number): ImageNote | undefined {
+  if (imageCount !== 1)
+    return undefined
+  const kind = imageCarrierKind(messages[index])
+  if (kind === 'google') {
+    const previous = messages[index - 1]
+    if (!isRecord(previous) || !Array.isArray(previous.parts) || previous.parts.length !== 1)
+      return undefined
+    const part = previous.parts[0]
+    return isRecord(part) && isRecord(part.functionResponse)
+      ? noteIn(part.functionResponse)
+      : undefined
   }
-  return undefined
+  if (kind !== 'openai')
+    return undefined
+  let end = index - 1
+  const previous = messages[end]
+  // Some OpenAI-compatible providers require this exact assistant bridge.
+  if (isRecord(previous) && previous.role === 'assistant'
+    && previous.content === 'I have processed the tool results.' && !previous.tool_calls) {
+    end--
+  }
+  let start = end
+  while (start >= 0) {
+    const message = messages[start]
+    if (!isRecord(message) || message.role !== 'tool')
+      break
+    start--
+  }
+  // OpenAI merges consecutive tool results into one image carrier. Multiple
+  // results lose per-image ownership on the wire; do not guess at a path.
+  return end - start === 1
+    ? noteIn(messages[end])
+    : undefined
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -259,14 +276,56 @@ export function stripOldImages(
     if (refs.length === 0)
       continue
 
-    const note = nearbyNote(messages, i)
-    const text = placeholder(note?.path)
+    const liftedNote = carrierNote(messages, i, refs.length)
+    const scopeCounts = new Map<Record<string, unknown>, number>()
     for (const ref of refs) {
-      ref.parent[ref.index] = {
-        ...textPartFor(api, text),
-      }
+      if (ref.scope)
+        scopeCounts.set(ref.scope, (scopeCounts.get(ref.scope) ?? 0) + 1)
+    }
+    const replacements = new Map<unknown, Record<string, unknown>>()
+    for (const ref of refs) {
+      const note = ref.scope
+        ? scopeCounts.get(ref.scope) === 1
+          ? noteIn(ref.scope)
+          : undefined
+        : liftedNote
+      replacements.set(ref.parent[ref.index], textPartFor(api, placeholder(note?.path)))
       removed++
     }
+    // FunctionResponsePart accepts media only, not { text }. Move placeholders
+    // into the response JSON instead of producing an invalid Gemini 3 request.
+    if (api === 'google-generative-ai' || api === 'google-vertex') {
+      for (const scope of scopeCounts.keys()) {
+        if (!Array.isArray(scope.parts) || !isRecord(scope.response))
+          continue
+        const texts = scope.parts
+          .filter(isImagePart)
+          .map(part => replacements.get(part)?.text)
+          .filter((text): text is string => typeof text === 'string')
+        if (texts.length === 0)
+          continue
+        const { parts, ...rest } = scope
+        const keptParts = (parts as unknown[]).filter(part => !isImagePart(part))
+        const key = 'error' in scope.response
+          ? 'error'
+          : 'output'
+        const original = scope.response[key]
+        const response = typeof original === 'string'
+          ? { ...scope.response, [key]: `${original}\n${texts.join('\n')}` }
+          : {
+              ...scope.response,
+              imageHistory: texts.join('\n'),
+            }
+        replacements.set(scope, {
+          ...rest,
+          response,
+          ...(keptParts.length > 0
+            ? { parts: keptParts }
+            : {}),
+        })
+      }
+    }
+    messages[i] = replaceImageParts(messages[i], replacements)
   }
   return removed
 }
@@ -345,7 +404,7 @@ export default function (pi: ExtensionAPI): void {
       }
     }
 
-    // One note, written into the transcript so it survives reload and compaction.
+    // One note, written into the transcript so it survives reload and restarts.
     // Only when stripping is on: with `strip: false` the image stays in context
     // forever, so a path note would be permanent clutter nobody ever needs.
     const noteLines: string[] = []
@@ -416,15 +475,18 @@ export default function (pi: ExtensionAPI): void {
     if (!config.strip)
       return undefined
 
+    // Native pi-messages payloads can share objects with session history.
+    // Copy the envelope/list here; the strip pass copies changed ancestors only.
+    const payload = copyPayloadMessages(event.payload)
     const removed = stripOldImages(
-      event.payload,
+      payload,
       ctx.model?.api,
       config.keepTurns,
       config.maxKeptImages,
     )
     // Return undefined when nothing changed, so the body object is left alone.
     return removed > 0
-      ? event.payload
+      ? payload
       : undefined
   })
 }

@@ -713,7 +713,10 @@ describe('hooks', () => {
         { images: 1 },
       ])
       const out = await handlers.before_provider_request!({ payload } as never, ctx as never)
-      expect(out).toBe(payload)
+      expect(out).not.toBe(payload)
+      expect(countImages(payload)).toBe(3)
+      expect(countImages(out)).toBe(1)
+      expect(countPlaceholders(out)).toBe(2)
     }
     finally {
       rmSync(cwd, { recursive: true, force: true })

@@ -19,7 +19,7 @@ minute of uploading before the model even starts thinking.
 Two things can happen, at two different moments. The first is on by default; the second is
 opt-in.
 
-**When an image arrives**, it is compressed:
+**When a tool returns an image**, it is compressed:
 
 ```
 your screenshot  →  6.4x smaller WebP
@@ -31,11 +31,11 @@ your screenshot  →  6.4x smaller WebP
 [image removed from history to save upload bandwidth. Re-read /proj/title.png if you need to see it again.]
 ```
 
-Compression is invisible — same picture, fewer bytes, the model sees exactly what it saw
-before. Replacement rewrites history, so it ships off and you decide. Switch it on when a slow
-link is the real problem: each image is then uploaded a small, bounded number of times, and
-what stays behind is a path plus a description — enough for the model to know what the picture
-was, and to fetch it again if it really needs to.
+Compression reduces resolution and uses lossy WebP encoding. It can save substantial bandwidth,
+but small text and fine lines may lose detail. Replacement changes the history visible to the
+model, so it ships off and you decide. While an image is inside the kept window it is still
+uploaded with every request; once it expires, a placeholder and any available path and
+description remain.
 
 ## Install
 
@@ -98,16 +98,18 @@ Image description: [1] Header area: dark nav bar, a sign-in button on the right.
 Image description: [2] Footer area: grey link list, copyright at the bottom.
 ```
 
-Because this is ordinary transcript text, it survives `/reload`, restarts, and compaction.
+Because this is ordinary transcript text, it survives `/reload` and restarts. After compaction,
+which details remain depends on the summary.
 The description is generated once, though its tokens are paid on every later request. With
 stripping off none of this is written: an image that never leaves context needs no address and
 no description, so that round trip is skipped too.
 
 **`before_provider_request`** — runs on the finished request body, just before it goes out.
 
-Every image whose turn is over becomes a placeholder (`strip`). Nothing else is touched. This
-pass never decodes anything: it swaps object pointers, so a 30 MB body costs about a
-millisecond.
+Images outside the kept turns become placeholders (`strip`). This pass never decodes image
+data and copies only changed object ancestors, preserving images in session history. Gemini 3
+function-response media arrays do not accept text parts, so their placeholders are added to
+the same function response's JSON text instead.
 
 ### What the model sees
 
@@ -128,15 +130,15 @@ the previous turn's images become placeholders and the new turn starts clean. `k
   came from. A count-based window got this wrong: the third screenshot pushed the first one
   out in the middle of the task that needed both.
 - The model needs another look → it `read`s the path, and that one image is uploaded again.
-- Nothing changes *within* a turn, so the request prefix is byte-identical on every step of a
-  loop and the prompt cache keeps hitting. The cut lands on a turn boundary, which costs
-  exactly one cache miss — in the request where those images actually went stale.
+- With the image-count cap disabled, stripping does not change an existing prefix *within*
+  a turn, which helps prompt-cache reuse. Expiring images changes the prefix; actual cache
+  hits depend on provider rules, cache lifetime, and other request changes.
 
-The catch: an agent working on its own never sees a new user message, so the turn never ends
-and nothing would ever be stripped. Measured over a 30-step loop at 68 KB per screenshot that
-is **31 MB** (ideal: 2 MB). `maxKeptImages` is the escape hatch, and it stays at `0` — no cap —
-because cutting inside a turn buys bandwidth with a cache miss on every step, a trade only you
-can price. Set it to 6–8 on a slow link and the same loop costs 11–14 MB.
+The catch: an agent working on its own sees no new user message, so the turn never ends
+and turn-based stripping does not apply. For a 30-step loop at 68 KB per screenshot, estimated
+cumulative image upload is **31 MB** (about 2 MB if each were sent once). `maxKeptImages` is
+the escape hatch, and stays at `0` — no cap — because cutting inside a turn changes the
+cache prefix more frequently. Set it to 6–8 on a slow link and the same loop is about 11–14 MB.
 
 ### Why WebP
 
@@ -189,9 +191,9 @@ of being reinterpreted as `maxKeptImages` — that would quietly impose a cap no
 | `true` | `true` | Smaller images, and old ones become text. |
 | `false` | `true` | Full-size images, old ones become text. |
 
-The default changes nothing about the conversation — the model can always look back at any
-image — while still cutting upload by about 84%. Turn `strip` on when that is not enough, on
-a slow, metered, or proxied link.
+The default keeps every image visible, but the images themselves are compressed with loss.
+The four screenshot samples above use about 84% fewer image bytes; savings and detail loss
+vary with the image. Turn `strip` on when you need to reduce historical image uploads further.
 
 `caption` only does something while `strip` is on: an image that never leaves context does
 not need a description, so the extra round trip is skipped automatically. `keepTurns` below 1
@@ -211,8 +213,7 @@ in your Pi config or uninstall it — one way instead of three.
 
 ## Compatibility
 
-The placeholder shape is chosen from the model's API, so switching providers does not produce
-a 400:
+The placeholder shape is chosen from the model's API:
 
 | API | Part |
 | --- | --- |
@@ -220,33 +221,42 @@ a 400:
 | `openai-responses`, `azure-openai-responses`, `openai-codex-responses` | `{ type: "input_text", text }` |
 | `google-generative-ai`, `google-vertex`, `bedrock-converse-stream` | `{ text }` |
 
-Images are detected in all of them, including images nested inside `tool_result`.
+Supported layouts include nested tool results and pi-messages' `context.messages` envelope.
+For Google's `functionResponse.parts`, expired images are removed and placeholders are added
+to the function response's `response` JSON; text blocks are never inserted into its media array.
+
+Paths come from the individual tool result that owns an image. When OpenAI merges images
+from several tool results and ownership is ambiguous, placeholders omit re-read paths. The
+original path and description notes remain.
 
 ## Caveats
 
-- **Compression lowers resolution permanently.** Re-`read`ing the file will not bring back a
-  detail — Pi applies the same resize every time. Raise `maxEdge` for small text.
+- **Compression and captions only process tool-returned images.** Pasted or attached user
+  images bypass both stages, but can still be stripped once old when `strip` is on.
+- **Compression loses detail.** Source files are unchanged, but session history stores the
+  compressed image. Re-`read`ing with the same settings compresses it again. Raise `maxEdge`
+  for small text, or turn `compress` off.
 - **A description can be wrong.** A confident but incorrect one is worse than none, because
   the model will reason from it. Descriptions come from the same model that already saw the
   image, and nothing is sent anywhere new, but they are not verified. Set
   `"caption": false` to turn them off.
 - **A description is written once and never retried.** If that request times out, the
   placeholder stays path-only. Raise `captionTimeoutMs` to make that less likely.
-- **Reading an image costs one extra model round trip**, because the description is generated
-  before the tool result is committed. Images are handled one at a time, so ten images means
-  ten round trips.
-- **Prompt cache misses once per turn boundary**, when the previous turn's images are replaced.
-  The `tools` and `system` layers still hit; only `messages` is invalidated. With
-  `maxKeptImages` set, the cut moves every step and you pay that miss every step.
+- **With `strip` and `caption` on, each tool image costs an extra model round trip**, because
+  the description is generated before the tool result is committed. Images are handled one at
+  a time, so ten images means ten round trips.
+- **Stripping changes the cache prefix.** Turn-based stripping limits changes within a turn;
+  setting `maxKeptImages` can change it more often. Cache reuse and costs depend on the provider.
 - **A batch of images cannot be re-read.** When one call returns several images, Pi reports one
   `path`, so none of them can claim it. The descriptions survive; the pixels do not.
 - **The model may answer from the description instead of looking again.** For pixel-level
   work, ask it to re-`read` the file.
 - **A long task keeps every image it reads**, because the turn never ends. That is the price of
   the cache-friendly cut. Lower `maxKeptImages` if the uploads hurt more than the misses.
-- **Turn boundaries depend on how Pi serialises a turn**, i.e. on a real `user` message and on
-  the synthetic carrier Pi creates for tool images. If a future Pi changes that shape, the
-  extension degrades safely: it finds no boundary and strips nothing.
+- **Turn boundaries depend on Pi's serialization.** Recognized tool results and synthetic
+  image messages do not start turns; user text plus images does. Ambiguous image-only messages
+  do not start turns either, which can retain extra old images. Future Pi layout changes
+  require compatibility review.
 - **Old sessions are not retrofitted.** Only images read while the extension is active get
   compressed and described.
 - **Session files still keep the compressed image**, not just the text. Stripping only
@@ -259,7 +269,7 @@ git clone https://github.com/wiidede/pi-image-slim
 cd pi-image-slim
 pnpm install
 pnpm check       # lint + typecheck + tests
-pnpm test        # 69 tests, no network, no fixtures
+pnpm test        # offline; reads Pi's bundled screenshots and creates/cleans temporary config files
 ```
 
 ## License

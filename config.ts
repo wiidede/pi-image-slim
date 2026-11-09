@@ -37,8 +37,8 @@ export interface ImageSlimConfig {
   /**
    * Hard cap on how many image-bearing messages survive, across all kept turns.
    * `0` disables the cap. It exists for the one case a turn boundary never closes:
-   * an agent working on its own. Cutting inside a turn costs a cache miss per
-   * step, so this stays opt-in — lower it on a slow link.
+   * an agent working on its own. Cutting inside a turn changes the cache prefix
+   * more often, so this stays opt-in — lower it on a slow link.
    */
   maxKeptImages: number
   /** Longest edge kept when re-encoding. Applies to the longer of width/height. */
@@ -53,7 +53,7 @@ export const DEFAULTS: ImageSlimConfig = {
   compress: true,
   caption: true,
   // Stripping rewrites history, which is not something to do to someone who did
-  // not ask for it. Compression alone is invisible: same pixels, fewer bytes.
+  // not ask for it. Compression keeps images visible, with reduced detail.
   strip: false,
   keepTurns: 1,
   // No cap by default: an arbitrary cap inside a turn trades prompt cache for
