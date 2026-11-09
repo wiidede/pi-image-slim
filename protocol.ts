@@ -59,6 +59,39 @@ export function isImagePart(part: unknown): boolean {
   return false
 }
 
+/**
+ * Is this user message an artefact of a tool returning images rather than the
+ * user actually speaking? Turn boundaries must never land on one of these.
+ *
+ * Pi hoists tool images out of the result: `openai-completions` pushes a
+ * synthetic user message with a fixed header, `anthropic-messages` wraps them in
+ * a `tool_result` block, google and bedrock leave a bare image part. A false
+ * positive here (calling a tool artefact a real turn) cuts the current turn in
+ * half, so the test is deliberately generous — mistaking a user's own pasted
+ * image for an artefact is harmless, because it sits *after* the turn start and
+ * is therefore kept either way.
+ */
+export function isImageCarrier(message: unknown): boolean {
+  if (!isRecord(message) || message.role !== 'user')
+    return false
+  // `content` for openai/anthropic/bedrock, `parts` for google.
+  for (const list of [message.content, message.parts]) {
+    if (!Array.isArray(list))
+      continue
+    for (const part of list) {
+      if (!isRecord(part))
+        continue
+      if (isImagePart(part) || part.type === 'tool_result')
+        return true
+      if (part.type === 'text' && typeof part.text === 'string'
+        && part.text.startsWith('Attached image(s) from tool result')) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
 /** Top-level message array: `messages` (openai), `input` (responses), `contents` (google). */
 export function topLevelMessages(payload: unknown): unknown[] | undefined {
   if (!isRecord(payload))

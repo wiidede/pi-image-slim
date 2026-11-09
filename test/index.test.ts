@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import extension, { captionWanted, stripOldImages } from '../index.ts'
+import extension, { captionWanted, stripOldImages, turnStart } from '../index.ts'
 
 // ─────────────────────────────────────────────────────────────
 // helpers
@@ -135,7 +135,7 @@ function payloadWith(turns: { images: number, bytes?: number }[]): { messages: u
 // ─────────────────────────────────────────────────────────────
 
 describe('keep window', () => {
-  it('keeps every image when the window is not exceeded', () => {
+  it('keeps every image when there is only one turn', () => {
     const payload = {
       messages: [
         { role: 'user', content: 'hi' },
@@ -156,50 +156,159 @@ describe('keep window', () => {
         ...batchCycle(1, 10),
       ],
     }
-    // Two messages, window of 2 — nothing to do.
-    expect(stripOldImages(payload, 'openai-completions', 2)).toBe(0)
-    expect(countImages(payload)).toBe(20)
+    expect(stripOldImages(payload, 'openai-completions', 1)).toBe(0)
+    expect(stripOldImages(payload, 'openai-completions', 1, 8)).toBe(0)
   })
 
-  it('replaces images older than the window', () => {
+  it('keeps every image in the current turn', () => {
+    // Three screenshots in one turn. The old count-based window of 2 would have
+    // hidden the first one while the agent was still comparing all three.
     const payload = {
       messages: [
-        { role: 'user', content: 'hi' },
-        ...batchCycle(0, 3),
-        ...batchCycle(1, 2),
+        { role: 'user', content: 'compare these' },
+        ...imageCycle(0),
+        ...imageCycle(1),
+        ...imageCycle(2),
       ],
     }
-    expect(stripOldImages(payload, 'openai-completions', 1)).toBe(3)
+    expect(turnStart(payload.messages, 1)).toBe(0)
+    expect(stripOldImages(payload, 'openai-completions')).toBe(0)
+    expect(countImages(payload)).toBe(3)
+  })
+
+  it('strips everything the user has moved on from', () => {
+    const payload = payloadWith([
+      { images: 3 },
+      { images: 2 },
+    ])
+    expect(stripOldImages(payload, 'openai-completions')).toBe(3)
     expect(countPlaceholders(payload)).toBe(3)
     expect(countImages(payload)).toBe(2)
   })
 
-  it('drops every image in a long agent loop, keeping only the window', () => {
-    // The case the old turn-based rule missed: one user message, then many
-    // autonomous steps. `turnStart()` never moved, so nothing was ever stripped
-    // and every screenshot was re-uploaded on every step.
+  it('strips an old image even when it is the only one in the payload', () => {
+    // Once the user speaks again, the previous turn's screenshot is history. The
+    // model still has the description and the path.
+    const payload = {
+      messages: [
+        { role: 'user', content: 'look at this' },
+        ...imageCycle(0),
+        { role: 'assistant', content: 'done' },
+        { role: 'user', content: 'now do something else' },
+      ],
+    }
+    expect(stripOldImages(payload, 'openai-completions')).toBe(1)
+    expect(countImages(payload)).toBe(0)
+  })
+
+  it('keeps the newest N turns when asked', () => {
+    const payload = payloadWith([
+      { images: 1 },
+      { images: 1 },
+      { images: 1 },
+    ])
+    expect(stripOldImages(payload, 'openai-completions', 2)).toBe(1)
+    expect(countImages(payload)).toBe(2)
+  })
+
+  it('leaves a turn that never ends alone when the cap is off', () => {
+    // An agent working on its own: one user message, then many steps. No image
+    // ever lands in an older turn, so nothing is stripped — every step sends a
+    // byte-identical prefix and the prompt cache keeps hitting, at the cost of
+    // re-uploading each screenshot on every step.
+    const messages: unknown[] = [
+      { role: 'user', content: 'fix the CSS everywhere' },
+    ]
+    let n = 0
+    for (let step = 0; step < 30; step++) {
+      messages.push(...imageCycle(n++, 68_000))
+      const payload = {
+        messages: structuredClone(messages),
+      }
+      expect(stripOldImages(payload, 'openai-completions')).toBe(0)
+      expect(countImages(payload)).toBe(step + 1)
+    }
+  })
+
+  it('bounds a turn that never ends once maxKeptImages is set', () => {
+    // The opt-in escape hatch for a slow link: cut inside the turn instead of at
+    // its boundary, accepting one cache miss per step.
     const messages: unknown[] = [
       { role: 'user', content: 'fix the CSS everywhere' },
     ]
     let n = 0
     let totalSentBytes = 0
     const STEPS = 30
+    const CAP = 8
     for (let step = 0; step < STEPS; step++) {
       messages.push(...imageCycle(n++, 68_000))
       const payload = {
         messages: structuredClone(messages),
       }
-      stripOldImages(payload, 'openai-completions', 2)
+      stripOldImages(payload, 'openai-completions', 1, CAP)
       totalSentBytes += sizeOf(payload)
+      expect(countImages(payload)).toBe(Math.min(step + 1, CAP))
     }
-    // Ideal is 30 images × 68 KB sent once; a window of 2 costs at most 3x that.
+    // Ideal is 30 images × 68 KB sent once. Uncapped it is 16x that; a cap of 8
+    // brings it to about 7x.
     const ideal = STEPS * 68_000
-    expect(totalSentBytes).toBeLessThan(ideal * 3)
-    // The old behaviour was ~16x ideal.
+    expect(totalSentBytes).toBeLessThan(ideal * 8)
     expect(totalSentBytes).toBeGreaterThan(ideal)
   })
 
-  it('never strips the newest message, even with a window of 1', () => {
+  it('never treats a tool image as a turn boundary', () => {
+    // Pi hoists tool images into a synthetic user message. Counting that as a
+    // turn would cut the current turn in half and hide the first screenshot.
+    const payload = {
+      messages: [
+        { role: 'user', content: 'compare these' },
+        ...imageCycle(0),
+        ...imageCycle(1),
+      ],
+    }
+    expect(turnStart(payload.messages, 1)).toBe(0)
+    expect(stripOldImages(payload, 'openai-completions')).toBe(0)
+  })
+
+  it('reads google image parts as carriers, not as turn boundaries', () => {
+    // Google puts a user message's content in `parts`, so a rule that only looks
+    // at `content` sees the tool's image as the user speaking.
+    const payload = {
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: 'compare' },
+          ],
+        },
+        {
+          role: 'user',
+          parts: [
+            {
+              inlineData: {
+                mimeType: 'image/png',
+                data: 'x',
+              },
+            },
+          ],
+        },
+        {
+          role: 'user',
+          parts: [
+            {
+              inlineData: {
+                mimeType: 'image/png',
+                data: 'y',
+              },
+            },
+          ],
+        },
+      ],
+    }
+    expect(stripOldImages(payload, 'google-generative-ai')).toBe(0)
+  })
+
+  it('never strips the newest image, whatever the turn bookkeeping says', () => {
     const payload = payloadWith([
       { images: 1 },
       { images: 1 },
@@ -575,27 +684,74 @@ describe('hooks', () => {
     expect(handlers.tool_result).toBeDefined()
     expect(handlers.before_provider_request).toBeDefined()
 
-    const result = (await handlers.tool_result!(
-      {
-        input: { path: '/a/b.png' },
-        content: [
-          { type: 'image', data: 'AAA', mimeType: 'image/png' },
-        ],
-      } as never,
-      { model: undefined } as never,
-    )) as { content: { text?: string }[] } | undefined
-    expect(result).toBeDefined()
-    expect(result!.content.at(-1)?.text).toBe('Image file: /a/b.png')
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-image-slim-hooks-'))
+    try {
+      mkdirSync(join(cwd, '.pi'), { recursive: true })
+      writeFileSync(
+        join(cwd, '.pi', 'pi-image-slim.json'),
+        JSON.stringify({ strip: true, compress: false }),
+      )
 
-    const ctx = {
-      model: { api: 'openai-completions' },
+      const result = (await handlers.tool_result!(
+        {
+          input: { path: '/a/b.png' },
+          content: [
+            { type: 'image', data: 'AAA', mimeType: 'image/png' },
+          ],
+        } as never,
+        { cwd, model: undefined } as never,
+      )) as { content: { text?: string }[] } | undefined
+      expect(result).toBeDefined()
+      expect(result!.content.at(-1)?.text).toBe('Image file: /a/b.png')
+
+      const ctx = {
+        cwd,
+        model: { api: 'openai-completions' },
+      }
+      const payload = payloadWith([
+        { images: 2 },
+        { images: 1 },
+      ])
+      const out = await handlers.before_provider_request!({ payload } as never, ctx as never)
+      expect(out).toBe(payload)
     }
-    const payload = payloadWith([
-      { images: 2 },
-      { images: 1 },
-    ])
-    const out = await handlers.before_provider_request!({ payload } as never, ctx as never)
-    expect(out).toBe(payload)
+    finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('leaves the body alone under the default config', async () => {
+    // Stripping ships off. Nothing is rewritten, so the request body is the very
+    // same object — and the image from the previous turn is still in it.
+    const handlers: Record<string, (...args: never[]) => unknown> = {}
+    extension({
+      on: (e: string, h: (...args: never[]) => unknown) => {
+        handlers[e] = h
+        return () => {}
+      },
+    } as never)
+
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-image-slim-defaults-'))
+    try {
+      const payload = payloadWith([
+        { images: 1 },
+        { images: 1 },
+      ])
+      const out = await handlers.before_provider_request!(
+        { payload } as never,
+        {
+          cwd,
+          model: {
+            api: 'openai-completions',
+          },
+        } as never,
+      )
+      expect(out).toBeUndefined()
+      expect(countImages(payload)).toBe(2)
+    }
+    finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
   })
 
   it('registers both hooks as async functions', () => {
@@ -677,7 +833,7 @@ describe('tool_result passthrough', () => {
   })
 
   it('writes the path note when stripping is on', async () => {
-    const out = await withConfig({ compress: false }, imageEvent)
+    const out = await withConfig({ compress: false, strip: true }, imageEvent)
     const texts = (out!.content as { type: string, text?: string }[])
       .filter(block => block.type === 'text')
       .map(block => block.text)
@@ -695,7 +851,7 @@ describe('tool_result passthrough', () => {
     }
     const structuredContent = { path: '/a/b.png', width: 64 }
     const out = await withConfig(
-      { compress: false },
+      { compress: false, strip: true },
       { ...imageEvent, details, structuredContent },
     )
     expect(out!.details).toEqual(details)
@@ -704,7 +860,7 @@ describe('tool_result passthrough', () => {
 
   it('numbers descriptions when one call returns several images', async () => {
     const out = await withConfig(
-      { compress: false },
+      { compress: false, strip: true },
       {
         input: { path: '/a/batch.png' },
         content: [
@@ -728,7 +884,7 @@ describe('tool_result passthrough', () => {
     // A failed caption used to be filtered out, shifting every later description
     // onto the wrong picture with no warning at all.
     const out = await withConfig(
-      { compress: false },
+      { compress: false, strip: true },
       {
         input: {},
         content: [
@@ -748,7 +904,7 @@ describe('tool_result passthrough', () => {
   })
 
   it('leaves details alone when the result has none', async () => {
-    const out = await withConfig({ compress: false }, imageEvent)
+    const out = await withConfig({ compress: false, strip: true }, imageEvent)
     expect('details' in out!).toBe(false)
     expect('structuredContent' in out!).toBe(false)
   })

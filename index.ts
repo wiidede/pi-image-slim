@@ -11,16 +11,15 @@
  *
  * The fix (two hooks)
  *   1. `tool_result`             — re-encode every image as WebP (capped longest
- *                                   edge), then ask the current model for a
- *                                   one-line description while the pixels are
- *                                   still visible. Write both the path and the
- *                                   description into a text note that stays in
+ *                                   edge). When stripping is on, also ask the
+ *                                   current model for a one-line description while
+ *                                   the pixels are still visible, and write the path
+ *                                   and description into a text note that stays in
  *                                   history.
  *   2. `before_provider_request` — the final serialized request body, one step
- *                                   before it goes on the wire. Images outside
- *                                   the newest `keepImages` image-bearing
- *                                   messages are replaced with a one-line text
- *                                   placeholder.
+ *                                   before it goes on the wire. Images from turns
+ *                                   older than the newest `keepTurns` are replaced
+ *                                   with a one-line text placeholder.
  *
  * Two stages of reduction
  *   Compression shrinks each image by roughly 3-8x, which cuts upload bandwidth
@@ -36,18 +35,26 @@
  *   bare path. It also means the strip pass never has to read pixels back out of
  *   a provider payload, so it stays a pure pointer swap.
  *
- * A sliding window of messages
- *   The newest `keepImages` messages that carry an image are sent verbatim;
- *   everything older becomes a placeholder. Three consequences:
+ * A window of turns, not of messages
+ *   Everything the agent produced since the newest `keepTurns` user messages were
+ *   spoken is sent verbatim; images from older turns become placeholders. Four
+ *   consequences:
  *
- *   · A tool that returns ten screenshots puts them in one message, so they
- *     travel together — reading ten images in one call still shows all ten.
- *   · The window does not care whether the user spoke. That matters: an agent
- *     working on its own keeps one user message at index 0 for the whole loop,
- *     so a turn-based rule strips nothing there and re-uploads every screenshot
- *     on every step. Measured over a 30-step loop, that is 31 MB instead of 2 MB.
- *   · Nothing depends on how Pi serialises a turn. The window is just "messages
- *     that contain an image", counted from the end.
+ *   · Reading ten screenshots in one turn keeps all ten visible for the rest of
+ *     that turn. A count-based window got this wrong: the third screenshot pushed
+ *     the first one out, in the middle of the task that needed both.
+ *   · Nothing changes *within* a turn, so the request prefix is byte-identical on
+ *     every step of a loop and the prompt cache keeps hitting. Stripping lands on
+ *     a turn boundary, which costs exactly one cache miss — in the request where
+ *     the images actually went stale.
+ *   · A turn boundary is a real user message. A tool that returns ten screenshots
+ *     hoists them into a synthetic user message of their own, and turning that
+ *     into a boundary would cut the turn in half, so carriers are skipped.
+ *   · An agent working on its own never sees a new user message: the turn never
+ *     ends, and a rule that only cuts at boundaries would strip nothing and
+ *     re-upload every screenshot on every step (31 MB over a 30-step loop,
+ *     measured). `maxKeptImages` is the answer, and it stays off by default — it
+ *     buys bandwidth with cache misses, which is a trade only the user can price.
  *
  * Properties
  *   · Compression is best-effort: a failure, an unsupported format, or a result
@@ -71,6 +78,7 @@ import { DEFAULTS, loadConfig } from './config.ts'
 import { compressImage } from './image.ts'
 import {
   collectImageParts,
+  isImageCarrier,
   isRecord,
   textPartFor,
   topLevelMessages,
@@ -188,25 +196,41 @@ function nearbyNote(messages: unknown[], index: number): ImageNote | undefined {
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Replace every image outside the newest `keepImages` image-bearing messages
- * with a text placeholder, in place. Returns the number of images replaced.
- *
- * The unit is the *message*, not the image. A tool that returns ten screenshots
- * puts them all in one message, and they live or die together — so reading ten
- * images in one call still shows the model all ten.
- *
- * Counting messages instead of locating turn boundaries is what makes this hold
- * inside a single agent loop. `turnStart()` used to key on the last real user
- * message, which never moves while the agent works on its own, so a 30-step loop
- * kept every screenshot and re-uploaded the lot on every request. With a window,
- * each image is uploaded once and then dropped, whether or not the user spoke.
+ * Index of the user message that opens the `keepTurns`-th newest turn. Everything
+ * at or after it is sent verbatim. Returns 0 — strip nothing — when the history
+ * holds fewer turns than that, which is also the safe answer when Pi's
+ * serialisation stops looking the way this expects.
  */
-export function stripOldImages(payload: unknown, api?: string, keepImages = DEFAULTS.keepImages): number {
+export function turnStart(messages: unknown[], keepTurns: number): number {
+  const starts: number[] = []
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]
+    if (isRecord(message) && message.role === 'user' && !isImageCarrier(message))
+      starts.push(i)
+  }
+  return starts.length < keepTurns
+    ? 0
+    : starts[starts.length - keepTurns]!
+}
+
+/**
+ * Replace every image older than the kept turns with a text placeholder, in
+ * place. Returns the number of images replaced.
+ *
+ * The unit is the *message*: a tool that returns ten screenshots puts them all in
+ * one message, and they live or die together — reading ten images in one call
+ * still shows the model all ten.
+ */
+export function stripOldImages(
+  payload: unknown,
+  api?: string,
+  keepTurns = DEFAULTS.keepTurns,
+  maxKeptImages = DEFAULTS.maxKeptImages,
+): number {
   const messages = topLevelMessages(payload)
   if (!messages)
     return 0
 
-  // One pass to find where the kept window begins.
   const carriers: number[] = []
   for (let i = 0; i < messages.length; i++) {
     const refs: ImageRef[] = []
@@ -214,10 +238,19 @@ export function stripOldImages(payload: unknown, api?: string, keepImages = DEFA
     if (refs.length > 0)
       carriers.push(i)
   }
-  if (carriers.length <= keepImages)
+  if (carriers.length === 0)
     return 0
 
-  const keepFrom = carriers[carriers.length - keepImages]!
+  let keepFrom = turnStart(messages, keepTurns)
+
+  // The cap is off by default. When it is on it can only ever move the cut
+  // forward, never back — it exists to bound a turn that never ends, not to
+  // overrule the turns the user asked to keep.
+  if (maxKeptImages > 0 && carriers.length > maxKeptImages)
+    keepFrom = Math.max(keepFrom, carriers[carriers.length - maxKeptImages]!)
+
+  if (keepFrom <= 0)
+    return 0
 
   let removed = 0
   for (let i = 0; i < keepFrom; i++) {
@@ -383,7 +416,12 @@ export default function (pi: ExtensionAPI): void {
     if (!config.strip)
       return undefined
 
-    const removed = stripOldImages(event.payload, ctx.model?.api, config.keepImages)
+    const removed = stripOldImages(
+      event.payload,
+      ctx.model?.api,
+      config.keepTurns,
+      config.maxKeptImages,
+    )
     // Return undefined when nothing changed, so the body object is left alone.
     return removed > 0
       ? event.payload

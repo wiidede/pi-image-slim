@@ -25,14 +25,22 @@ export interface ImageSlimConfig {
   compress: boolean
   /** Ask the current model to describe each image before the pixels are dropped. */
   caption: boolean
-  /** Replace images from earlier turns with a text placeholder. */
+  /** Replace images from earlier turns with a text placeholder. Off by default. */
   strip: boolean
   /**
-   * How many of the newest image-bearing messages stay in full. Everything older
-   * becomes a placeholder. At least one is always kept: the model has to be able
-   * to see the image it just asked for.
+   * How many of the newest *turns* stay in full. A turn starts at a real user
+   * message, so everything the agent produced since the user last spoke is kept
+   * verbatim. At least one is always kept: the model has to be able to see the
+   * image it just asked for.
    */
-  keepImages: number
+  keepTurns: number
+  /**
+   * Hard cap on how many image-bearing messages survive, across all kept turns.
+   * `0` disables the cap. It exists for the one case a turn boundary never closes:
+   * an agent working on its own. Cutting inside a turn costs a cache miss per
+   * step, so this stays opt-in — lower it on a slow link.
+   */
+  maxKeptImages: number
   /** Longest edge kept when re-encoding. Applies to the longer of width/height. */
   maxEdge: number
   /** WebP quality, 0-100. */
@@ -44,8 +52,13 @@ export interface ImageSlimConfig {
 export const DEFAULTS: ImageSlimConfig = {
   compress: true,
   caption: true,
-  strip: true,
-  keepImages: 2,
+  // Stripping rewrites history, which is not something to do to someone who did
+  // not ask for it. Compression alone is invisible: same pixels, fewer bytes.
+  strip: false,
+  keepTurns: 1,
+  // No cap by default: an arbitrary cap inside a turn trades prompt cache for
+  // upload bandwidth, and only the user knows which one their link needs.
+  maxKeptImages: 0,
   maxEdge: 1280,
   quality: 75,
   captionTimeoutMs: 20_000,
@@ -88,7 +101,8 @@ function apply(config: ImageSlimConfig, raw: RawConfig): ImageSlimConfig {
     compress: asBoolean(raw.compress) ?? config.compress,
     caption: asBoolean(raw.caption) ?? config.caption,
     strip: asBoolean(raw.strip) ?? config.strip,
-    keepImages: asInteger(raw.keepImages, 1, 20) ?? config.keepImages,
+    keepTurns: asInteger(raw.keepTurns, 1, 20) ?? config.keepTurns,
+    maxKeptImages: asInteger(raw.maxKeptImages, 0, 200) ?? config.maxKeptImages,
     maxEdge: asInteger(raw.maxEdge, 1, 20_000) ?? config.maxEdge,
     quality: asInteger(raw.quality, 0, 100) ?? config.quality,
     captionTimeoutMs: asInteger(raw.captionTimeoutMs, 0, 600_000) ?? config.captionTimeoutMs,

@@ -31,8 +31,16 @@ describe('loadConfig', () => {
     expect(loadConfig({ agentDir, cwd, env: {} })).toEqual(DEFAULTS)
   })
 
+  it('leaves stripping off by default, so compression stands alone', () => {
+    // Rewriting history is not something to do to someone who did not ask for it.
+    writeUser({})
+    const config = loadConfig({ agentDir, cwd, env: {} })
+    expect(config.strip).toBe(false)
+    expect(config.compress).toBe(true)
+  })
+
   it('reads the user-level file', () => {
-    writeUser({ maxEdge: 1024, quality: 60 })
+    writeUser({ maxEdge: 1024, quality: 60, strip: true })
     const config = loadConfig({ agentDir, cwd, env: {} })
     expect(config.maxEdge).toBe(1024)
     expect(config.quality).toBe(60)
@@ -62,21 +70,41 @@ describe('loadConfig', () => {
     expect(config).toEqual({ ...DEFAULTS, maxEdge: 900 })
   })
 
-  it('never accepts keepImages below 1, which would strip everything', () => {
+  it('never accepts keepTurns below 1, which would strip everything', () => {
     for (const bogus of [0, -1, 0.4]) {
-      writeUser({ keepImages: bogus })
-      expect(loadConfig({ agentDir, cwd, env: {} }).keepImages, String(bogus))
-        .toBe(DEFAULTS.keepImages)
+      writeUser({ keepTurns: bogus })
+      expect(loadConfig({ agentDir, cwd, env: {} }).keepTurns, String(bogus))
+        .toBe(DEFAULTS.keepTurns)
     }
   })
 
-  it('reads a valid keepImages', () => {
+  it('reads a valid keepTurns', () => {
     for (const value of [1, 3, 20]) {
-      writeUser({ keepImages: value })
-      expect(loadConfig({ agentDir, cwd, env: {} }).keepImages).toBe(value)
+      writeUser({ keepTurns: value })
+      expect(loadConfig({ agentDir, cwd, env: {} }).keepTurns).toBe(value)
     }
-    writeUser({ keepImages: 21 })
-    expect(loadConfig({ agentDir, cwd, env: {} }).keepImages).toBe(DEFAULTS.keepImages)
+    writeUser({ keepTurns: 21 })
+    expect(loadConfig({ agentDir, cwd, env: {} }).keepTurns).toBe(DEFAULTS.keepTurns)
+  })
+
+  it('reads maxKeptImages, where 0 means no cap', () => {
+    writeUser({ maxKeptImages: 0 })
+    expect(loadConfig({ agentDir, cwd, env: {} }).maxKeptImages).toBe(0)
+    writeUser({ maxKeptImages: 8 })
+    expect(loadConfig({ agentDir, cwd, env: {} }).maxKeptImages).toBe(8)
+    // A negative cap would mean "keep nothing", which is never what anyone wants.
+    writeUser({ maxKeptImages: -1 })
+    expect(loadConfig({ agentDir, cwd, env: {} }).maxKeptImages)
+      .toBe(DEFAULTS.maxKeptImages)
+  })
+
+  it('ignores the pre-0.2 keepImages key instead of guessing what it meant', () => {
+    // It counted messages, not turns; treating it as maxKeptImages would quietly
+    // impose a cap nobody asked for.
+    writeUser({ keepImages: 2 })
+    const config = loadConfig({ agentDir, cwd, env: {} })
+    expect(config.maxKeptImages).toBe(0)
+    expect(config.keepTurns).toBe(1)
   })
 
   it('ignores values of the wrong type or out of range', () => {

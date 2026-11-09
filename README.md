@@ -2,8 +2,8 @@
 
 [中文文档](./README.zh-CN.md)
 
-A [Pi](https://pi.dev) extension that shrinks screenshots and stops old ones from being
-re-uploaded.
+A [Pi](https://pi.dev) extension that shrinks screenshots, and optionally stops old ones from
+being re-uploaded.
 
 ## The problem
 
@@ -16,26 +16,26 @@ minute of uploading before the model even starts thinking.
 
 ## The fix
 
-Two things happen, at two different moments. Each can be turned off on its own.
+Two things can happen, at two different moments. The first is on by default; the second is
+opt-in.
 
-**When an image arrives**, it is compressed and described:
+**When an image arrives**, it is compressed:
 
 ```
-your screenshot  →  6.4x smaller WebP  +  one-line description
+your screenshot  →  6.4x smaller WebP
 ```
 
-**Once it falls out of the window**, it is replaced by text:
+**Once its turn is over**, it can be replaced by text (`"strip": true`):
 
 ```
 [image removed from history to save upload bandwidth. Re-read /proj/title.png if you need to see it again.]
 ```
 
-So each image is uploaded a small, bounded number of times, and what stays behind is a path
-plus a description — enough for the model to know what the picture was, and to fetch it again
-if it really needs to.
-
-If you would rather keep every image in view, set `"strip": false`. You still get the 6.4x
-compression, and the model never loses sight of anything.
+Compression is invisible — same picture, fewer bytes, the model sees exactly what it saw
+before. Replacement rewrites history, so it ships off and you decide. Switch it on when a slow
+link is the real problem: each image is then uploaded a small, bounded number of times, and
+what stays behind is a path plus a description — enough for the model to know what the picture
+was, and to fetch it again if it really needs to.
 
 ## Install
 
@@ -62,7 +62,7 @@ Four real screenshots from Pi's own docs, compressed to 1280 px / WebP / quality
 | **total** | **2.4 MB** | **377 KB** | **6.4x** |
 
 That saves bandwidth on the turn the image is sent, **and** disk space in the session file.
-Stripping saves bandwidth on every turn after that.
+Stripping, when you turn it on, saves bandwidth on every turn after that.
 
 ## Who this is for
 
@@ -79,8 +79,9 @@ Two hooks, nothing more.
 **`tool_result`** — runs when a tool returns an image.
 
 1. Re-encodes PNG/JPEG as WebP with the longest edge capped at `maxEdge` (`compress`).
-2. Asks the current model to describe the stored bytes in one line (`caption`).
-3. Writes both into the conversation as plain text:
+2. If stripping is on, asks the current model to describe the stored bytes in one line
+   (`caption`).
+3. Writes the path and that description into the conversation as plain text:
 
 ```
 Image file: /proj/docs/mockups/title.png
@@ -98,38 +99,44 @@ Image description: [2] Footer area: grey link list, copyright at the bottom.
 ```
 
 Because this is ordinary transcript text, it survives `/reload`, restarts, and compaction.
-The description is generated once, though its tokens are paid on every later request.
+The description is generated once, though its tokens are paid on every later request. With
+stripping off none of this is written: an image that never leaves context needs no address and
+no description, so that round trip is skipped too.
 
 **`before_provider_request`** — runs on the finished request body, just before it goes out.
 
-Every image outside the newest `keepImages` image-bearing messages becomes a placeholder
-(`strip`). Nothing else is touched. This pass never decodes anything: it swaps object pointers, so a 30 MB body costs
-about a millisecond.
+Every image whose turn is over becomes a placeholder (`strip`). Nothing else is touched. This
+pass never decodes anything: it swaps object pointers, so a 30 MB body costs about a
+millisecond.
 
 ### What the model sees
 
 | | Sent |
 | --- | --- |
-| The newest `keepImages` messages that carry an image | full image |
-| Anything older | placeholder + path |
+| Every image read since you last spoke | full image |
+| Images from earlier turns | placeholder + path |
 | The description note | always |
+| Nothing at all, with `strip: false` (the default) | full image, forever |
 
-### A window of messages, not of images
+### A window of turns, not of images
 
-The last two image-bearing messages are sent in full; everything older is a placeholder.
+Everything the agent has produced since you last spoke is sent verbatim. When you speak again,
+the previous turn's images become placeholders and the new turn starts clean. `keepTurns`
+(default `1`) moves that boundary further back.
 
-- Ten screenshots from **one** tool call share one message, so all ten arrive in full and the
-  model can compare them. The window counts messages, not pictures.
-- Each new screenshot pushes the oldest one out. The image is still there in the description
-  note, so the model knows what it was.
+- Ten screenshots in **one** turn stay visible for the whole turn, however many tool calls they
+  came from. A count-based window got this wrong: the third screenshot pushed the first one
+  out in the middle of the task that needed both.
 - The model needs another look → it `read`s the path, and that one image is uploaded again.
+- Nothing changes *within* a turn, so the request prefix is byte-identical on every step of a
+  loop and the prompt cache keeps hitting. The cut lands on a turn boundary, which costs
+  exactly one cache miss — in the request where those images actually went stale.
 
-The window is why this also works inside a single long task. While the agent works on its own
-there is no new user message, so a boundary based on "the last thing you typed" would never
-move and every screenshot would be re-uploaded on every step. Measured over a 30-step loop at
-68 KB per screenshot: **31 MB with a turn boundary, 4.1 MB with a window of 2** (ideal is 2 MB).
-
-Set `"keepImages": 1` for the strictest version — each image is then uploaded exactly once.
+The catch: an agent working on its own never sees a new user message, so the turn never ends
+and nothing would ever be stripped. Measured over a 30-step loop at 68 KB per screenshot that
+is **31 MB** (ideal: 2 MB). `maxKeptImages` is the escape hatch, and it stays at `0` — no cap —
+because cutting inside a turn buys bandwidth with a cache miss on every step, a trade only you
+can price. Set it to 6–8 on a slow link and the same loop costs 11–14 MB.
 
 ### Why WebP
 
@@ -151,17 +158,19 @@ A JSON file, not environment variables. Two locations, most specific last:
 {
   "maxEdge": 1280,
   "quality": 75,
-  "strip": true,
-  "keepImages": 2
+  "strip": false,
+  "keepTurns": 1,
+  "maxKeptImages": 0
 }
 ```
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `compress` | `true` | Re-encode PNG/JPEG as WebP |
-| `caption` | `true` | Describe each image before the pixels go away |
-| `strip` | `true` | Replace old images with a placeholder |
-| `keepImages` | `2` | How many recent image messages stay intact (1-20) |
+| `caption` | `true` | Describe each image before the pixels go away (only used while `strip` is on) |
+| `strip` | `false` | Replace old images with a placeholder |
+| `keepTurns` | `1` | How many recent turns keep their images (1-20) |
+| `maxKeptImages` | `0` | Cap on image-bearing messages, even inside a kept turn; `0` = no cap |
 | `maxEdge` | `1280` | Ceiling for the **longer** side |
 | `quality` | `75` | WebP quality, 0-100 |
 | `captionTimeoutMs` | `20000` | Fall back to a bare path after this long; `0` = no limit |
@@ -169,20 +178,23 @@ A JSON file, not environment variables. Two locations, most specific last:
 Every key is optional. Unknown keys and bad values are ignored, and a malformed file falls
 back to defaults instead of breaking tool results. Run `/reload` after editing.
 
+0.1.x's `keepImages` is gone. It counted messages rather than turns, so it is ignored instead
+of being reinterpreted as `maxKeptImages` — that would quietly impose a cap nobody asked for.
+
 ### Pick your level
 
 | `compress` | `strip` | What happens |
 | --- | --- | --- |
-| `true` | `true` | **Default.** Smaller images, old ones become text. |
-| `true` | `false` | Images shrink ~6x, but the model keeps seeing all of them. |
+| `true` | `false` | **Default.** Images shrink ~6x, and the model keeps seeing all of them. |
+| `true` | `true` | Smaller images, and old ones become text. |
 | `false` | `true` | Full-size images, old ones become text. |
 
-`"strip": false` changes nothing about the conversation — the model can always look back at
-any image — while still cutting upload by about 84%. That is the safest setting if you are
-unsure.
+The default changes nothing about the conversation — the model can always look back at any
+image — while still cutting upload by about 84%. Turn `strip` on when that is not enough, on
+a slow, metered, or proxied link.
 
 `caption` only does something while `strip` is on: an image that never leaves context does
-not need a description, so the extra round trip is skipped automatically. `keepImages` below 1
+not need a description, so the extra round trip is skipped automatically. `keepTurns` below 1
 is ignored, because the model has to be able to see the image it just asked for.
 
 **Raise `maxEdge` if you work with small text** — 1568 is a common choice. Keep it at 2000 or
@@ -223,16 +235,18 @@ Images are detected in all of them, including images nested inside `tool_result`
 - **Reading an image costs one extra model round trip**, because the description is generated
   before the tool result is committed. Images are handled one at a time, so ten images means
   ten round trips.
-- **Prompt cache misses once**, on the turn after an image was read. The `tools` and `system`
-  layers still hit; only `messages` is invalidated.
+- **Prompt cache misses once per turn boundary**, when the previous turn's images are replaced.
+  The `tools` and `system` layers still hit; only `messages` is invalidated. With
+  `maxKeptImages` set, the cut moves every step and you pay that miss every step.
 - **A batch of images cannot be re-read.** When one call returns several images, Pi reports one
   `path`, so none of them can claim it. The descriptions survive; the pixels do not.
 - **The model may answer from the description instead of looking again.** For pixel-level
   work, ask it to re-`read` the file.
-- **Old images are invisible to the model within a long task.** With a window of 2, a
-  screenshot taken ten steps ago is a placeholder by the time the model wants to re-check it.
-  The description is still there; the pixels are one `read` away. Raise `keepImages` if you
-  work across many screenshots at once.
+- **A long task keeps every image it reads**, because the turn never ends. That is the price of
+  the cache-friendly cut. Lower `maxKeptImages` if the uploads hurt more than the misses.
+- **Turn boundaries depend on how Pi serialises a turn**, i.e. on a real `user` message and on
+  the synthetic carrier Pi creates for tool images. If a future Pi changes that shape, the
+  extension degrades safely: it finds no boundary and strips nothing.
 - **Old sessions are not retrofitted.** Only images read while the extension is active get
   compressed and described.
 - **Session files still keep the compressed image**, not just the text. Stripping only
@@ -245,7 +259,7 @@ git clone https://github.com/wiidede/pi-image-slim
 cd pi-image-slim
 pnpm install
 pnpm check       # lint + typecheck + tests
-pnpm test        # 59 tests, no network, no fixtures
+pnpm test        # 69 tests, no network, no fixtures
 ```
 
 ## License
