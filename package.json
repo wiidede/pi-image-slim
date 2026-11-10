@@ -25,8 +25,7 @@
     "context",
     "bandwidth",
     "upload",
-    "tokens",
-    "screenshot"
+    "tokens"
   ],
   "pi": {
     "extensions": [

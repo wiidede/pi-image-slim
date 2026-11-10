@@ -5,7 +5,7 @@ import { captionImage } from '../caption.ts'
 import { compressImage } from '../image.ts'
 
 /**
- * A real screenshot shipped with the Pi package, so decoding, resizing and
+ * A real image shipped with the Pi package, so decoding, resizing and
  * encoding are exercised against actual PNG bytes rather than a synthetic stub.
  * The package blocks `package.json` through `exports`, so resolve the fixture
  * from the project's own `node_modules` directory instead.

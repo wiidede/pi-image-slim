@@ -5,7 +5,7 @@
  *   `chat/completions` is stateless: every request is a full snapshot of the
  *   conversation. Once an image enters history, its base64 payload is re-sent on
  *   every subsequent turn. Prompt caching saves server-side compute, not
- *   bandwidth. A session that has read 30 MB of screenshots therefore uploads
+ *   bandwidth. A session that has read 30 MB of images therefore uploads
  *   30 MB per turn — on a 500 KB/s uplink that is ~60 s of pure upload before the
  *   model even starts thinking.
  *
@@ -40,18 +40,18 @@
  *   spoken is sent verbatim; images from older turns become placeholders. Four
  *   consequences:
  *
- *   · Reading ten screenshots in one turn keeps all ten visible for the rest of
- *     that turn. A count-based window got this wrong: the third screenshot pushed
+ *   · Reading ten images in one turn keeps all ten visible for the rest of
+ *     that turn. A count-based window got this wrong: the third one pushed
  *     the first one out, in the middle of the task that needed both.
  *   · With the cap off, stripping does not change existing prefixes within a
  *     turn. Expiry changes the prefix at turn boundaries; actual cache reuse
  *     depends on the provider's rules and cache lifetime.
- *   · A turn boundary is a real user message. A tool that returns ten screenshots
+ *   · A turn boundary is a real user message. A tool that returns ten images
  *     hoists them into a synthetic user message of their own, and turning that
  *     into a boundary would cut the turn in half, so carriers are skipped.
  *   · An agent working on its own never sees a new user message: the turn never
  *     ends, and a rule that only cuts at boundaries would strip nothing and
- *     re-upload every screenshot on every step (31 MB over a 30-step loop,
+ *     re-upload every image on every step (31 MB over a 30-step loop,
  *     measured). `maxKeptImages` is the answer, and it stays off by default — it
  *     buys bandwidth with cache misses, which is a trade only the user can price.
  *
@@ -99,7 +99,7 @@ const PI_MAX_EDGE = 2000
 
 /**
  * Placeholder text. `path` is undefined for images that never had a file
- * (clipboard, drag & drop, most MCP screenshot tools). The description is not
+ * (clipboard, drag & drop, most MCP image tools). The description is not
  * repeated here: it is already in the adjacent note, and repeating it would pay
  * those tokens on every request forever.
  */
@@ -234,9 +234,9 @@ export function turnStart(messages: unknown[], keepTurns: number): number {
  * Replace every image older than the kept turns with a text placeholder, in
  * place. Returns the number of images replaced.
  *
- * The unit is the *message*: a tool that returns ten screenshots puts them all in
- * one message, and they live or die together — reading ten images in one call
- * still shows the model all ten.
+ * The unit is the *message*: a tool that returns ten images puts them all in
+ * one message, and they live or die together — one call returning ten still
+ * shows the model all ten.
  */
 export function stripOldImages(
   payload: unknown,

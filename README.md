@@ -2,8 +2,8 @@
 
 [中文文档](./README.zh-CN.md)
 
-A [Pi](https://pi.dev) extension that shrinks screenshots, and optionally stops old ones from
-being re-uploaded.
+A [Pi](https://pi.dev) extension that shrinks images, and optionally stops old ones from being
+re-uploaded.
 
 ## The problem
 
@@ -11,7 +11,7 @@ Pi sends the whole conversation with every request. Prompt caching makes that ch
 server, but not for your uplink — an image that entered the conversation is uploaded again on
 **every single turn**, forever.
 
-Read 30 MB of screenshots and you upload 30 MB per turn. On a 500 KB/s connection that is a
+Read 30 MB of images and you upload 30 MB per turn. On a 500 KB/s connection that is a
 minute of uploading before the model even starts thinking.
 
 ## The fix
@@ -22,7 +22,7 @@ opt-in.
 **When a tool returns an image**, it is compressed:
 
 ```
-your screenshot  →  6.4x smaller WebP
+your image  →  6.4x smaller WebP
 ```
 
 **Once its turn is over**, it can be replaced by text (`"strip": true`):
@@ -51,7 +51,7 @@ pi -e npm:pi-image-slim
 
 ## Measured
 
-Four real screenshots from Pi's own docs, compressed to 1280 px / WebP / quality 75:
+Four real images from Pi's own docs, compressed to 1280 px / WebP / quality 75:
 
 | File | Before | After | |
 | --- | --- | --- | --- |
@@ -66,7 +66,7 @@ Stripping, when you turn it on, saves bandwidth on every turn after that.
 
 ## Who this is for
 
-- You read screenshots, mockups, or browser captures into Pi
+- You read images into Pi — screenshots, mockups, browser captures
 - You are on a slow, metered, or proxied connection
 - Requests feel slow while the model seems idle
 
@@ -126,8 +126,8 @@ Everything the agent has produced since you last spoke is sent verbatim. When yo
 the previous turn's images become placeholders and the new turn starts clean. `keepTurns`
 (default `1`) moves that boundary further back.
 
-- Ten screenshots in **one** turn stay visible for the whole turn, however many tool calls they
-  came from. A count-based window got this wrong: the third screenshot pushed the first one
+- Ten images in **one** turn stay visible for the whole turn, however many tool calls they
+  came from. A count-based window got this wrong: the third one pushed the first one
   out in the middle of the task that needed both.
 - The model needs another look → it `read`s the path, and that one image is uploaded again.
 - With the image-count cap disabled, stripping does not change an existing prefix *within*
@@ -135,14 +135,14 @@ the previous turn's images become placeholders and the new turn starts clean. `k
   hits depend on provider rules, cache lifetime, and other request changes.
 
 The catch: an agent working on its own sees no new user message, so the turn never ends
-and turn-based stripping does not apply. For a 30-step loop at 68 KB per screenshot, estimated
+and turn-based stripping does not apply. For a 30-step loop at 68 KB per image, estimated
 cumulative image upload is **31 MB** (about 2 MB if each were sent once). `maxKeptImages` is
 the escape hatch, and stays at `0` — no cap — because cutting inside a turn changes the
 cache prefix more frequently. Set it to 6–8 on a slow link and the same loop is about 11–14 MB.
 
 ### Why WebP
 
-Measured on real screenshots it beats JPEG by 30-45% at the same visual quality, and roughly
+Measured on real interface images it beats JPEG by 30-45% at the same visual quality, and roughly
 ties on photos. AVIF compresses further but Anthropic rejects it with a 400, and Pi rewrites
 unknown formats to PNG — which makes them bigger. Compression is best-effort: an unsupported
 format, a failure, or a result that is not actually smaller all leave the original alone.
@@ -192,7 +192,7 @@ of being reinterpreted as `maxKeptImages` — that would quietly impose a cap no
 | `false` | `true` | Full-size images, old ones become text. |
 
 The default keeps every image visible, but the images themselves are compressed with loss.
-The four screenshot samples above use about 84% fewer image bytes; savings and detail loss
+The four samples above use about 84% fewer image bytes; savings and detail loss
 vary with the image. Turn `strip` on when you need to reduce historical image uploads further.
 
 `caption` only does something while `strip` is on: an image that never leaves context does
@@ -203,8 +203,8 @@ is ignored, because the model has to be able to see the image it just asked for.
 below: above that, Pi's own image normalisation re-encodes the result and throws the WebP
 away.
 
-**`maxEdge` measures the longer side**, so a 1200×4000 phone screenshot shrinks by its height
-just like a wide desktop capture shrinks by its width.
+**`maxEdge` measures the longer side**, so a 1200×4000 portrait phone image shrinks by its height
+just like a wide desktop one shrinks by its width.
 
 ## Disable
 
@@ -231,8 +231,11 @@ original path and description notes remain.
 
 ## Caveats
 
-- **Compression and captions only process tool-returned images.** Pasted or attached user
-  images bypass both stages, but can still be stripped once old when `strip` is on.
+- **Compression and captions only run on images a tool returns.** `ctrl+v` is not an
+  exception: Pi writes the clipboard image to a temp file and inserts that path into the
+  editor, so the model `read`s it and that read is a tool result. An image attached straight
+  to a message — the RPC `images` field, or `@shot.png` in the first prompt — bypasses both
+  stages, but can still be stripped once old when `strip` is on.
 - **Compression loses detail.** Source files are unchanged, but session history stores the
   compressed image. Re-`read`ing with the same settings compresses it again. Raise `maxEdge`
   for small text, or turn `compress` off.
@@ -269,7 +272,7 @@ git clone https://github.com/wiidede/pi-image-slim
 cd pi-image-slim
 pnpm install
 pnpm check       # lint + typecheck + tests
-pnpm test        # offline; reads Pi's bundled screenshots and creates/cleans temporary config files
+pnpm test        # offline; reads Pi's bundled sample images and creates/cleans temporary config files
 ```
 
 ## License
